@@ -1,0 +1,34 @@
+{
+  "enabled": {
+    "description": "是否启用思考内容过滤",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后插件不做任何处理，输出原样发送。"
+  },
+  "tags": {
+    "description": "需要过滤的标签名列表",
+    "type": "list",
+    "default": [
+      "think"
+    ],
+    "hint": "默认只处理 think。可追加 reasoning、analysis 等，插件会自动匹配 <名称 属性...> ... </名称>。"
+  },
+  "log_removed": {
+    "description": "是否记录被移除的思考内容到日志",
+    "type": "bool",
+    "default": false,
+    "hint": "开启后会把被删掉的思考文本写入插件日志，仅用于调试。"
+  },
+  "strip_whitespace": {
+    "description": "过滤后是否清理首尾空白",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后保留原始首尾空白。"
+  },
+  "stream_buffer_limit": {
+    "description": "流式缓冲区上限（字符）",
+    "type": "int",
+    "default": 256,
+    "hint": "为避免不完整标签被切断而保留的最大缓冲长度。只有疑似标签开头的尾部内容才会被缓冲，正常文本会立即输出。"
+  }
+}
