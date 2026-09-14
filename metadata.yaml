@@ -1,6 +1,6 @@
-name: astrbot_plugin_think_filter # 插件唯一识别名，推荐 astrbot_plugin_ 开头，全小写无空格
-display_name: 思考内容过滤器 # 插件市场/WebUI 展示名
-desc: 在消息发送给用户前，移除 LLM 输出中的 <think> 思考块，同时兼容非流式与流式输出。
+name: astrbot_plugin_think_filter
+display_name: 思考内容过滤器
+desc: 在消息发送给用户前移除 LLM 输出中的 <think> 思考内容，兼容非流式与流式输出。
 short_desc: 过滤 LLM 的 <think> 思考内容
 version: 1.0.0
 author: Zxin-Pro
