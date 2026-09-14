@@ -2,7 +2,7 @@ name: astrbot_plugin_think_filter
 display_name: 思考内容过滤器
 desc: 在消息发送给用户前移除 LLM 输出中的 <think> 思考内容，兼容非流式与流式输出。
 short_desc: 过滤 LLM 的 <think> 思考内容
-version: 1.0.0
+version: 1.0.1
 author: Zxin-Pro
 repo: https://github.com/Zxin-Pro/astrbot_plugin_think_filter
 astrbot_version: ">=4.24.0,<5"
