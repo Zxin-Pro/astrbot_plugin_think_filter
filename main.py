@@ -50,10 +50,19 @@ class ThinkFilterPlugin(Star):
         return bool(self.config.get("filter_streaming", True))
 
     def _tags(self) -> list[str]:
-        tags = self.config.get("tags", ["think"])
+        """读取标签配置；容错处理用户手写成逗号/空格分隔字符串的情况。"""
+        tags = self.config.get("tags", ["think", "thinking"])
+        if isinstance(tags, str):
+            # 容错：'think,thinking' / 'think thinking' 也能用
+            tags = [t for t in __import__("re").split(r"[,，;；\s]+", tags) if t]
         if not isinstance(tags, list):
-            tags = ["think"]
-        return [str(t) for t in tags if str(t).strip()] or ["think"]
+            tags = ["think", "thinking"]
+        result = [str(t).strip().lower() for t in tags if str(t).strip()]
+        return result or ["think", "thinking"]
+
+    def _unclosed_action(self) -> str:
+        value = str(self.config.get("unclosed_action", "drop")).strip().lower()
+        return value if value in ("drop", "keep") else "drop"
 
     def _log_removed(self) -> bool:
         return bool(self.config.get("log_removed", False))
@@ -66,6 +75,17 @@ class ThinkFilterPlugin(Star):
             return int(self.config.get("stream_buffer_limit", 256))
         except (TypeError, ValueError):
             return 256
+
+    async def initialize(self) -> None:
+        """插件加载时打印生效的配置，方便在日志里确认配置是否真正生效。"""
+        self.logger.info(
+            "[think_filter] v%s 已加载 | tags=%s | 未闭合=%s | 流式过滤=%s | 移除日志=%s",
+            "1.2.0",
+            self._tags(),
+            self._unclosed_action(),
+            self._stream_enabled(),
+            self._log_removed(),
+        )
 
     # -- 非流式 -----------------------------------------------------------
 
@@ -80,6 +100,7 @@ class ThinkFilterPlugin(Star):
                 raw,
                 tags=self._tags(),
                 strip_whitespace=self._strip_whitespace(),
+                unclosed_action=self._unclosed_action(),
             )
             if cleaned != raw:
                 removed += len(raw) - len(cleaned)
@@ -100,6 +121,7 @@ class ThinkFilterPlugin(Star):
         tags = self._tags()
         log_removed = self._log_removed()
         buffer_limit = self._buffer_limit()
+        unclosed_action = self._unclosed_action()
         plugin_logger = self.logger
 
         def get_text(chain):
@@ -138,7 +160,10 @@ class ThinkFilterPlugin(Star):
 
         async def wrapper():
             filt = StreamThinkFilter(
-                tags=tags, log_removed=log_removed, buffer_limit=buffer_limit
+                tags=tags,
+                log_removed=log_removed,
+                buffer_limit=buffer_limit,
+                unclosed_action=unclosed_action,
             )
             broken = False  # 过滤器是否已失效（失效后全部原样透传）
             try:
@@ -230,6 +255,56 @@ class ThinkFilterPlugin(Star):
         except Exception:
             # 补丁失败只影响过滤，不影响机器人正常回复
             self.logger.exception("[think_filter] 流式接管失败")
+
+    # -- 指令：查看生效配置 ------------------------------------------------
+
+    @filter.command("think状态")
+    async def think_status(self, event: AstrMessageEvent):
+        """查看思考过滤器当前生效的配置（用于确认配置是否真正加载）。"""
+        yield event.plain_result(
+            "[think_filter] 当前生效配置\n"
+            f"版本: 1.2.0\n"
+            f"启用: {self._enabled()}\n"
+            f"过滤标签: {', '.join(self._tags())}\n"
+            f"未闭合处理: {self._unclosed_action()}\n"
+            f"流式过滤: {self._stream_enabled()}\n"
+            f"移除日志: {self._log_removed()}\n"
+            "提示：修改配置后需「重载插件」才会生效。"
+        )
+
+    # -- 钩子：LLM 响应后（清理历史记录） ---------------------------------
+
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp) -> None:
+        """LLM 响应后清理 completion_text 中的思考内容。
+
+        作用：写入会话历史前把 think 块清掉，避免模型在后续轮次
+        看到自己历史里的思考内容，导致越写越多。
+
+        注意：流式显示不经过这里（内容早已逐块发送），本钩子只影响
+        存入历史的最终文本；非流式场景与 on_decorating_result 双重保险。
+        """
+        if not self._enabled():
+            return
+        try:
+            text = getattr(resp, "completion_text", None)
+            if not isinstance(text, str) or not text:
+                return
+            cleaned = strip_think(
+                text,
+                tags=self._tags(),
+                strip_whitespace=self._strip_whitespace(),
+                unclosed_action=self._unclosed_action(),
+            )
+            if cleaned != text:
+                resp.completion_text = cleaned
+                if self._log_removed():
+                    self.logger.info(
+                        "[think_filter] 历史记录已移除 %d 字符思考内容",
+                        len(text) - len(cleaned),
+                    )
+        except Exception:
+            self.logger.exception("[think_filter] 历史清理失败，已跳过")
 
     # -- 钩子：发送消息前（非流式路径） ------------------------------------
 

@@ -85,6 +85,8 @@ def install_stubs():
 
         on_decorating_result = _deco
         on_llm_request = _deco
+        on_llm_response = _deco
+        command = _deco
 
     event_mod.AstrMessageEvent = AstrMessageEvent
     event_mod.MessageChain = MessageChain
@@ -159,9 +161,15 @@ class FakeEvent:
         self.sent_stream = None
         self.sent_args = None
         self.patched = False
+        self.replies = []
 
     def get_result(self):
         return self._result
+
+    def plain_result(self, text):
+        r = FakeResult(chain=[Plain(text)])
+        self.replies.append(r)
+        return r
 
     async def send_streaming(self, generator, use_fallback=False):
         """模拟真实平台适配器：接收生成器并逐块消费。"""
@@ -209,7 +217,7 @@ def stream_text(event):
 # ---------------------------------------------------------------------------
 # 非流式
 # ---------------------------------------------------------------------------
-p = main.ThinkFilterPlugin(None, {"enabled": True, "tags": ["think"]})
+p = main.ThinkFilterPlugin(None, {"enabled": True})  # tags 走默认 ["think","thinking"]
 
 r = asyncio.run(run_plugin(p, FakeResult(chain=[Plain("<think>内部思考</think>正式回复")])))
 check("非流式-移除思考块", r.chain[0].text, "正式回复")
@@ -229,6 +237,25 @@ check("非流式-关闭开关不处理", r.chain[0].text, "<think>x</think>y")
 custom = main.ThinkFilterPlugin(None, {"enabled": True, "tags": ["think", "reasoning"]})
 r = asyncio.run(run_plugin(custom, FakeResult(chain=[Plain("<reasoning>x</reasoning>正文")])))
 check("非流式-自定义标签", r.chain[0].text, "正文")
+
+# 关键回归：<thinking> 标签（用户模型实际输出的形式）默认必须被过滤
+r = asyncio.run(
+    run_plugin(p, FakeResult(chain=[Plain("<thinking>内部思考</thinking>\n大半夜的 喊谁呢")]))
+)
+check("非流式-thinking标签默认过滤", r.chain[0].text, "大半夜的 喊谁呢")
+
+# 配置容错：tags 写成逗号分隔字符串也能用
+strcfg = main.ThinkFilterPlugin(None, {"enabled": True, "tags": "thinking"})
+check("配置容错-字符串tags", strcfg._tags(), ["thinking"])
+
+# 未闭合 keep 模式：不再吞掉整条回复
+keep = main.ThinkFilterPlugin(
+    None, {"enabled": True, "tags": ["think"], "unclosed_action": "keep"}
+)
+r = asyncio.run(run_plugin(keep, FakeResult(chain=[Plain("正文<think>后面全保留")])))
+check("非流式-未闭合keep保留", r.chain[0].text, "正文<think>后面全保留")
+r = asyncio.run(run_plugin(keep, FakeResult(chain=[Plain("A<think>B</think>C")])))
+check("非流式-keep仍过滤成对标签", r.chain[0].text, "AC")
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +414,53 @@ check(
     stream_text(ev),
     "正文",
 )
+
+# 流式：<thinking> 默认过滤
+ev = asyncio.run(
+    run_stream_hook(p, ["<think", "ing>", "思考", "</thin", "king>", "\n回复内容"])
+)
+check("流式-thinking标签默认过滤", stream_text(ev), "\n回复内容")
+
+# 流式：未闭合 keep 模式不吞回复
+ev = asyncio.run(run_stream_hook(keep, ["正文", "<think>", "后面全保留"]))
+check("流式-未闭合keep保留", stream_text(ev), "正文<think>后面全保留")
+
+
+# on_llm_response：历史记录清理
+async def run_resp_hook(text):
+    class FakeResp:
+        pass
+
+    resp = FakeResp()
+    resp.completion_text = text
+    await p.on_llm_response(FakeEvent(), resp)
+    return resp.completion_text
+
+
+check(
+    "历史清理-移除thinking块",
+    asyncio.run(run_resp_hook("<thinking>abc</thinking>\n回复")),
+    "回复",
+)
+check(
+    "历史清理-无标签原样",
+    asyncio.run(run_resp_hook("正常回复")),
+    "正常回复",
+)
+
+
+# think状态 指令
+async def run_status():
+    ev = FakeEvent()
+    gen = p.think_status(ev)
+    async for _ in gen:
+        pass
+    return ev.replies[-1].chain[0].text
+
+
+status_text = asyncio.run(run_status())
+check("指令-包含版本", "1.2.0" in status_text, True)
+check("指令-包含标签", "think, thinking" in status_text, True)
 
 
 # ---------------------------------------------------------------------------

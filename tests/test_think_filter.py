@@ -58,7 +58,7 @@ check(
 )
 check(
     "非流式-不误删 thinking 标签",
-    strip_think("<thinking>不该删</thinking>"),
+    strip_think("<thinking>不该删</thinking>", tags=("think",)),
     "<thinking>不该删</thinking>",
 )
 check(

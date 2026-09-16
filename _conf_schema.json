@@ -9,9 +9,20 @@
     "description": "需要过滤的标签名列表",
     "type": "list",
     "default": [
-      "think"
+      "think",
+      "thinking"
     ],
-    "hint": "默认只处理 think。可追加 reasoning、analysis 等，插件会自动匹配 <名称 属性...> ... </名称>。"
+    "hint": "默认同时匹配 think 和 thinking。模型用哪种写法就配置哪种；改完配置后必须重载插件才生效，可用指令「think状态」查看当前生效的配置。"
+  },
+  "unclosed_action": {
+    "description": "未闭合标签的处理方式",
+    "type": "string",
+    "default": "drop",
+    "options": [
+      "drop",
+      "keep"
+    ],
+    "hint": "drop=删除从标签开始到结尾的全部内容（可能连带正常回复）；keep=保留不过滤。若模型经常忘记闭合标签导致回复丢失，改为 keep。"
   },
   "log_removed": {
     "description": "是否记录被移除的思考内容到日志",

@@ -50,10 +50,15 @@ def normalize_tags(tags: Iterable[str]) -> tuple[str, ...]:
 
 def strip_think(
     text: str,
-    tags: Iterable[str] = ("think",),
+    tags: Iterable[str] = ("think", "thinking"),
     strip_whitespace: bool = True,
+    unclosed_action: str = "drop",
 ) -> str:
-    """非流式兜底：一次性移除所有思考块（含未闭合情况）。
+    """非流式兜底：一次性移除所有思考块。
+
+    unclosed_action:
+        - "drop": 未闭合标签时删除从标签到结尾的全部内容（默认，按规范）
+        - "keep": 未闭合标签时不过滤（防止模型忘闭合导致回复被吞）
 
     任何异常都会被捕获并返回原文，保证不会因为过滤失败导致机器人不回复。
     """
@@ -72,8 +77,9 @@ def strip_think(
 
         pair_re, unclosed_re = _get_patterns(norm)
         result = pair_re.sub("", text)
-        # 成对替换后可能残留未闭合的起始标签，再删到结尾
-        result = unclosed_re.sub("", result)
+        # 成对替换后可能残留未闭合的起始标签；按配置决定是否删到结尾
+        if unclosed_action != "keep":
+            result = unclosed_re.sub("", result)
         return result.strip() if strip_whitespace else result
     except Exception:
         return text
@@ -120,16 +126,20 @@ class StreamThinkFilter:
 
     def __init__(
         self,
-        tags: Iterable[str] = ("think",),
+        tags: Iterable[str] = ("think", "thinking"),
         log_removed: bool = False,
         buffer_limit: int = 256,
+        unclosed_action: str = "drop",
     ) -> None:
         self.tags: tuple[str, ...] = normalize_tags(tags)
         self.log_removed = log_removed
         self.buffer_limit = max(32, int(buffer_limit))
+        self.unclosed_action = unclosed_action
         self.buffer = ""
         self.state = STATE_OUTSIDE
         self.removed_parts: list[str] = []
+        # 当前未闭合思考块的内容暂存（keep 模式 flush 时需要还原）
+        self._current_inside: list[str] = []
 
     # -- 标签识别 ---------------------------------------------------------
 
@@ -233,16 +243,20 @@ class StreamThinkFilter:
                     if self.state == STATE_OUTSIDE:
                         hit = self._match_open_tag(self.buffer, 0)
                         if hit is not None:
-                            # 命中起始标签 -> 进入丢弃状态
+                            # 命中起始标签 -> 进入丢弃状态，开始暂存当前块内容
+                            # （keep 模式 flush 时需要还原标签本身）
+                            tag_text = self.buffer[:hit]
                             self.buffer = self.buffer[hit:]
                             self.state = STATE_INSIDE
+                            self._current_inside = [tag_text]
                             continue
                     else:
                         hit = self._match_close_tag(self.buffer, 0)
                         if hit is not None:
-                            # 命中结束标签 -> 回到输出状态
+                            # 命中结束标签 -> 回到输出状态，当前块内容已入 removed_parts
                             self.buffer = self.buffer[hit:]
                             self.state = STATE_OUTSIDE
+                            self._current_inside = []
                             continue
                         # 思考块内部的嵌套起始标签直接丢弃、不改变状态
                         nest = self._match_open_tag(self.buffer, 0)
@@ -293,18 +307,26 @@ class StreamThinkFilter:
     def flush(self) -> str:
         """流结束时调用。
 
-        - 仍在思考块内（未闭合 <think>）：丢弃缓冲区，等效"删到结尾"；
+        - 仍在思考块内（未闭合标签）：默认丢弃缓冲区，等效"删到结尾"；
+          若 unclosed_action == "keep"，则原样输出缓冲区（防止回复被吞）；
         - 否则缓冲区里只是疑似前缀，实际不是标签，原样输出。
         """
         residue, self.buffer = self.buffer, ""
         if self.state == STATE_INSIDE:
+            if self.unclosed_action == "keep":
+                # keep 模式：还原整个未闭合思考块（含已流经的内容）
+                return "".join(self._current_inside) + residue
             self._record_removed(residue)
             return ""
+        self._current_inside = []
         return residue
 
     def _record_removed(self, text: str) -> None:
-        if self.log_removed and text:
-            self.removed_parts.append(text)
+        if not text:
+            return
+        self.removed_parts.append(text)
+        if self.state == STATE_INSIDE:
+            self._current_inside.append(text)
 
     @property
     def removed_text(self) -> str:
