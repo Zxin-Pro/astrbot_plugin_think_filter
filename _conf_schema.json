@@ -23,7 +23,13 @@
     "description": "过滤后是否清理首尾空白",
     "type": "bool",
     "default": true,
-    "hint": "关闭后保留原始首尾空白。"
+    "hint": "仅对非流式输出生效；流式输出为保证兼容性不做首尾清理。"
+  },
+  "filter_streaming": {
+    "description": "是否过滤流式输出",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后流式输出不做过滤（非流式仍生效）。若流式场景出现异常可尝试关闭。"
   },
   "stream_buffer_limit": {
     "description": "流式缓冲区上限（字符）",

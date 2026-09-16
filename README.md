@@ -63,7 +63,7 @@ astrbot_plugin_think_filter/
 ├── ruff.toml                # lint 配置
 └── tests/
     ├── test_think_filter.py         # 过滤核心单测（35 例）
-    ├── test_plugin_integration.py   # 用 AstrBot API 桩跑钩子（18 例）
+    ├── test_plugin_integration.py   # 用 AstrBot API 桩跑钩子（23 例）
     └── fuzz_think_filter.py         # 随机切块一致性模糊测试
 ```
 
@@ -81,7 +81,8 @@ astrbot_plugin_think_filter/
 | `enabled` | bool | `true` | 是否启用 |
 | `tags` | list | `["think"]` | 需要过滤的标签名，可加 `reasoning` 等 |
 | `log_removed` | bool | `false` | 是否把被移除的思考内容写入日志 |
-| `strip_whitespace` | bool | `true` | 过滤后是否清理首尾空白 |
+| `strip_whitespace` | bool | `true` | 过滤后是否清理首尾空白（仅非流式） |
+| `filter_streaming` | bool | `true` | 是否过滤流式输出；若流式场景异常可关闭此项 |
 | `stream_buffer_limit` | int | `256` | 流式疑似标签前缀的缓冲上限 |
 
 ## 实现要点
@@ -92,6 +93,8 @@ astrbot_plugin_think_filter/
 - **首字延迟**：只有"疑似标签前缀"（如 `<thi`、`<think type="`）会被缓冲，
   普通文本立即输出，所以正常回复的首字延迟不受影响。
 - **异常兜底**：正则或状态机抛异常时返回/放行原文；钩子内部异常只记日志，不影响正常回复。
+- **流式绝不丢消息（v1.1.1）**：流式包装器的任何环节出错都会自动降级为原样透传，
+  最坏情况是"内容未过滤"，绝不会"机器人不回复"。
 - **未闭合**：流结束时若仍在思考块内，丢弃缓冲区，等效"删除 `<think>` 到结尾"。
 
 ## 测试
@@ -99,7 +102,7 @@ astrbot_plugin_think_filter/
 ```bash
 cd astrbot_plugin_think_filter
 python3 tests/test_think_filter.py        # 35 passed
-python3 tests/test_plugin_integration.py  # 18 passed
+python3 tests/test_plugin_integration.py  # 23 passed
 python3 tests/fuzz_think_filter.py        # 0 mismatches
 ```
 

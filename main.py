@@ -7,8 +7,13 @@
   使用预编译正则一次性剥离思考块，异常时原样放回。
 - 流式：AstrBot v4.28.0 的 `STREAMING_RESULT` 会跳过 `on_decorating_result`，
   所以在 `on_llm_request` 中给当前 event 的 `send_streaming` 方法包一层，
-  让平台适配器逐块发送前经过有状态过滤器（见 think_filter.filter_stream）。
-  这样跨 chunk 的 `</thi` + `nk>` 也能正确处理。
+  让平台适配器逐块发送前经过有状态过滤器（见 think_filter.StreamThinkFilter）。
+
+安全原则（v1.1.1 起强制）：
+- 流式包装器的每一行都可能出错，因此所有环节都有兜底：
+  过滤失败 / 构造消息链失败时一律原样透传，绝不丢内容、绝不中断流。
+- 即使过滤器完全失效，消息也只会"未过滤"，不会"不回复"。
+- 可通过配置 filter_streaming=false 单独关闭流式过滤。
 """
 
 from __future__ import annotations
@@ -18,43 +23,15 @@ from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star
 
-from .think_filter import filter_stream, strip_think
+from .think_filter import StreamThinkFilter, strip_think
 
 
-def _lstrip_chunk(item):
-    """清理单块的**前导**空白；返回 None 表示该块已空。"""
+def _make_text_chain(text: str):
+    """把纯文本包成 MessageChain；失败返回 None（调用方自行决定兜底）。"""
     try:
-        if isinstance(item, str):
-            cleaned = item.lstrip()
-            return cleaned or None
-        chain = getattr(item, "chain", None)
-        if not chain:
-            return item
-        if isinstance(chain[0], Plain) and chain[0].text:
-            chain[0].text = chain[0].text.lstrip()
-        if len(chain) == 1 and isinstance(chain[0], Plain) and not chain[0].text:
-            return None
-        return item
+        return MessageChain(chain=[Plain(text=text)])
     except Exception:
-        return item
-
-
-def _rstrip_chunk(item):
-    """清理单块的**尾部**空白；返回 None 表示该块已空。"""
-    try:
-        if isinstance(item, str):
-            cleaned = item.rstrip()
-            return cleaned or None
-        chain = getattr(item, "chain", None)
-        if not chain:
-            return item
-        if isinstance(chain[-1], Plain) and chain[-1].text:
-            chain[-1].text = chain[-1].text.rstrip()
-        if len(chain) == 1 and isinstance(chain[0], Plain) and not chain[0].text:
-            return None
-        return item
-    except Exception:
-        return item
+        return None
 
 
 class ThinkFilterPlugin(Star):
@@ -68,6 +45,9 @@ class ThinkFilterPlugin(Star):
 
     def _enabled(self) -> bool:
         return bool(self.config.get("enabled", True))
+
+    def _stream_enabled(self) -> bool:
+        return bool(self.config.get("filter_streaming", True))
 
     def _tags(self) -> list[str]:
         tags = self.config.get("tags", ["think"])
@@ -106,24 +86,29 @@ class ThinkFilterPlugin(Star):
                 comp.text = cleaned
         return removed
 
-    def _build_stream_wrapper(self, source):
-        """把原始异步生成器包一层流式过滤器。
+    # -- 流式：包装器 ------------------------------------------------------
 
-        流产出的是 MessageChain（而不是裸字符串），所以：
-        - chunk_getter：从 MessageChain 里取出纯文本；
-        - chunk_setter：把过滤后的文本写回 MessageChain。
-        非文本链（图片、分段信号 type="break" 等）原样透传。
+    def _build_stream_wrapper(self, source):
+        """把原始异步生成器包一层有状态过滤器，返回新的异步生成器。
+
+        安全设计：
+        - 任何一块处理出错：该块原样透传，后续块降级为原样透传（过滤器停用）；
+        - set_text 失败：退化为原链（宁可漏过滤，不可丢消息）；
+        - 尾部残留转链失败：丢弃残留（只是疑似标签前缀，不是正文）；
+        - 本包装器绝不向消费者抛出"过滤自身"的异常。
         """
         tags = self._tags()
         log_removed = self._log_removed()
         buffer_limit = self._buffer_limit()
-        strip_ws = self._strip_whitespace()
         plugin_logger = self.logger
 
         def get_text(chain):
+            """取出链中的纯文本；带 type 的链（reasoning/break/tool_call）不处理。"""
+            if isinstance(chain, str):
+                # 兼容直接产出字符串的流
+                return chain
             try:
                 if getattr(chain, "type", None):
-                    # 带类型的链（reasoning / tool_call / break）保持原样，不做文本过滤
                     return None
                 text = chain.get_plain_text()
                 return text if isinstance(text, str) else None
@@ -131,100 +116,98 @@ class ThinkFilterPlugin(Star):
                 return None
 
         def set_text(chain, new_text):
-            """把过滤后的文本写回链对象，保留链里的非文本组件（图片等）。"""
-            try:
-                comps = list(getattr(chain, "chain", []) or [])
-                kept = [c for c in comps if not isinstance(c, Plain)]
-                replaced = False
-                result_comps = []
-                for comp in comps:
-                    if isinstance(comp, Plain) and not replaced:
-                        comp.text = new_text
-                        result_comps.append(comp)
-                        replaced = True
-                    elif isinstance(comp, Plain):
-                        continue  # 多余的 Plain 已被合并进首个
-                    else:
-                        result_comps.append(comp)
-                if not replaced:
-                    result_comps = [Plain(new_text), *kept]
-                chain.chain = result_comps
-                return chain
-            except Exception:
-                # 改写失败时退化为只输出文本，保证内容不丢
+            """构造保留元信息的新链；失败则原样返回旧链（漏过滤好过丢消息）。"""
+            if isinstance(chain, str):
                 return new_text
-
-        def report_removed(text: str) -> None:
-            plugin_logger.info(
-                "[think_filter] 已移除思考内容 %d 字符：%s",
-                len(text),
-                text if len(text) <= 500 else text[:500] + "...",
-            )
+            try:
+                new_chain = MessageChain(chain=[Plain(text=new_text)])
+                new_chain.type = getattr(chain, "type", None)
+                new_chain.use_t2i_ = getattr(chain, "use_t2i_", None)
+                new_chain.use_markdown_ = getattr(chain, "use_markdown_", None)
+                return new_chain
+            except Exception:
+                try:
+                    # 退化方案：直接改写首个 Plain 的文本
+                    for comp in getattr(chain, "chain", []) or []:
+                        if isinstance(comp, Plain):
+                            comp.text = new_text
+                            return chain
+                except Exception:
+                    pass
+                return chain
 
         async def wrapper():
-            # 逐块过滤：注意这里传的是 chain 对象，非文本块会被 filter_stream 原样 yield。
-            # 首尾空白只在"整条回复"的最前/最后一块上清理，绝不逐块 strip，
-            # 否则会破坏正文内部的换行与空格。
-            first = True
-            pending = None  # 延后一块，用来判断它是否是最后一块
-            async for item in filter_stream(
-                source,
-                tags=tags,
-                log_removed=log_removed,
-                buffer_limit=buffer_limit,
-                chunk_getter=get_text,
-                chunk_setter=set_text,
-                on_removed=report_removed if log_removed else None,
-            ):
-                # filter_stream 流结束时 flush 出的尾巴是裸字符串，
-                # 平台适配器要求 MessageChain，这里统一转换
-                if isinstance(item, str):
-                    item = MessageChain(chain=[Plain(item)])
+            filt = StreamThinkFilter(
+                tags=tags, log_removed=log_removed, buffer_limit=buffer_limit
+            )
+            broken = False  # 过滤器是否已失效（失效后全部原样透传）
+            try:
+                async for chain in source:
+                    if broken:
+                        yield chain
+                        continue
+                    try:
+                        text = get_text(chain)
+                        if not isinstance(text, str):
+                            # 非文本链（分段信号、工具状态等）原样透传
+                            yield chain
+                            continue
+                        filtered = filt.feed(text)
+                    except Exception:
+                        # 过滤环节出错：本块原样放行，后续全部降级为透传
+                        plugin_logger.exception("[think_filter] 流式过滤异常，已降级为原样透传")
+                        broken = True
+                        yield chain
+                        continue
 
-                if first:
-                    if strip_ws:
-                        item = _lstrip_chunk(item)
-                        if item is None:
-                            continue  # 该块被清空，仍是首块
-                    first = False
-                    pending = item
-                    continue
+                    if filtered:
+                        yield set_text(chain, filtered)
 
-                if pending is not None:
-                    yield pending
-                pending = item
+                # 流正常结束：处理尾部残留（未闭合 think 已在 flush 内丢弃）
+                tail = filt.flush()
+                if tail:
+                    tail_chain = _make_text_chain(tail)
+                    if tail_chain is not None:
+                        yield tail_chain
+            except Exception:
+                # source 本身（AstrBot 管线）的异常：按原语义向上抛，
+                # 但先把过滤器缓冲的残留输出，尽量减少内容丢失
+                plugin_logger.exception("[think_filter] 流式源异常")
+                try:
+                    tail = filt.flush()
+                    if tail:
+                        tail_chain = _make_text_chain(tail)
+                        if tail_chain is not None:
+                            yield tail_chain
+                except Exception:
+                    pass
+                raise
 
-            if pending is None:
-                return
-            if strip_ws:
-                pending = _rstrip_chunk(pending)
-                if pending is None:
-                    return
-            yield pending
+            if log_removed and filt.removed_text:
+                try:
+                    plugin_logger.info(
+                        "[think_filter] 已移除思考内容 %d 字符",
+                        len(filt.removed_text),
+                    )
+                except Exception:
+                    pass
 
         return wrapper()
 
-    # -- 钩子：LLM 请求前（流式过滤的真正挂点） ---------------------------
+    # -- 钩子：LLM 请求前（流式过滤挂点） ---------------------------------
 
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req) -> None:
         """LLM 请求发出前，给 event 实例的 send_streaming 打补丁。
 
         为什么不用 on_decorating_result 处理流式：
-        ResultDecorateStage 的 process() 开头就有
-        ``if result.result_content_type == ResultContentType.STREAMING_RESULT: return``
-        —— 流式进行中该钩子根本不会触发（只在结束后以 STREAMING_FINISH
-        触发一次，那时内容早已发完）。因此包装 async_stream 的做法是无效的。
+        ResultDecorateStage 的 process() 开头就跳过 STREAMING_RESULT，
+        流式进行中该钩子不会触发。详见 README。
 
-        真正的挂点是 event.send_streaming：RespondStage 在发送流式结果时调用
-        ``await event.send_streaming(result.async_stream, realtime_segmenting)``，
-        平台适配器拿到生成器后逐块迭代发送。这里在实例上覆盖该方法，
-        把生成器先包一层有状态过滤器再交给原实现，即可拦截流式内容。
-
-        补丁只作用于当前 event 实例（不污染类），并且用标记保证幂等，
-        Agent 多步执行多次触发 on_llm_request 时不会重复包装。
+        补丁只作用于当前 event 实例（不污染类），幂等可重入；
+        任何失败都不影响后续流程（最坏情况是流式不过滤）。
         """
-        if not self._enabled():
+        if not self._enabled() or not self._stream_enabled():
             return
         try:
             if getattr(event, "_think_filter_stream_patched", False):
@@ -233,56 +216,45 @@ class ThinkFilterPlugin(Star):
             if not callable(original):
                 return
             event._think_filter_stream_patched = True
-
             plugin = self
 
             async def patched_send_streaming(generator, *args, **kwargs):
-                wrapped = plugin._build_stream_wrapper(generator)
+                try:
+                    wrapped = plugin._build_stream_wrapper(generator)
+                except Exception:
+                    plugin.logger.exception("[think_filter] 构建流式过滤器失败，本次原样发送")
+                    wrapped = generator
                 return await original(wrapped, *args, **kwargs)
 
             event.send_streaming = patched_send_streaming
-            self.logger.debug("[think_filter] 已为本次事件接管 send_streaming")
         except Exception:
-            # 补丁失败不影响正常回复，非流式路径仍然有效
-            self.logger.error("[think_filter] 流式接管失败", exc_info=True)
+            # 补丁失败只影响过滤，不影响机器人正常回复
+            self.logger.exception("[think_filter] 流式接管失败")
 
     # -- 钩子：发送消息前（非流式路径） ------------------------------------
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent) -> None:
-        """发送消息前的钩子：主要处理非流式结果，并兼容旧/特殊路径。
+        """发送消息前的钩子：处理非流式结果。
 
         AstrBot v4.28.0 的 ResultDecorateStage 会跳过 STREAMING_RESULT，
-        所以真正的实时流式拦截由 on_llm_request 中的 send_streaming 补丁完成。
-
-        本钩子负责：
-        - 非流式：result.chain 里是完整文本，直接改写 Plain 组件；
-        - 某些不走 send_streaming 的特殊/降级路径：尽力清理完整结果；
-        - STREAMING_FINISH：只做兜底清理，该结果本身不会再次发送。
+        所以实时流式拦截由 on_llm_request 中的 send_streaming 补丁完成。
+        本钩子负责非流式完整文本的清理。
         """
         if not self._enabled():
             return
 
         try:
             result = event.get_result()
-            if result is None:
+            if result is None or not result.chain:
                 return
 
-            # 流式结果：包装 async_stream
-            stream = getattr(result, "async_stream", None)
-            if stream is not None:
-                result.async_stream = self._build_stream_wrapper(stream)
-                return
-
-            # 非流式结果：直接清理文本
-            if not result.chain:
-                return
             removed = self._clean_chain(result)
             if removed and self._log_removed():
                 self.logger.info("[think_filter] 非流式结果已移除 %d 字符思考内容", removed)
         except Exception:
             # 钩子里任何异常都不能影响机器人正常回复
-            self.logger.error("[think_filter] 过滤失败，已跳过本次处理", exc_info=True)
+            self.logger.exception("[think_filter] 非流式过滤失败，已跳过")
 
     async def terminate(self) -> None:
         """插件卸载/停用时调用。"""
