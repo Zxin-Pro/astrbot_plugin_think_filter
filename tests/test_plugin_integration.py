@@ -2,7 +2,8 @@
 
 目的：在没有真实 AstrBot 环境的情况下，验证
 - 非流式：on_decorating_result 会改写 message chain；
-- 流式：on_decorating_result 会包装 async_stream，逐块过滤且跨 chunk 正确；
+- 流式：on_llm_request 会接管 send_streaming，逐块过滤且跨 chunk 正确；
+- 流式尾部 flush 会转换为 MessageChain，不把裸字符串交给适配器；
 - 开关关闭时不生效；
 - 内部异常不影响事件（钩子不抛错）。
 
@@ -62,6 +63,14 @@ def install_stubs():
     class AstrMessageEvent:
         pass
 
+    class MessageChain:
+        def __init__(self, chain=None, type=None):
+            self.chain = list(chain or [])
+            self.type = type
+
+        def get_plain_text(self):
+            return "".join(getattr(c, "text", "") for c in self.chain)
+
     class _Filter:
         @staticmethod
         def on_decorating_result(*a, **kw):
@@ -70,7 +79,15 @@ def install_stubs():
 
             return deco
 
+        @staticmethod
+        def on_llm_request(*a, **kw):
+            def deco(fn):
+                return fn
+
+            return deco
+
     event_mod.AstrMessageEvent = AstrMessageEvent
+    event_mod.MessageChain = MessageChain
     event_mod.filter = _Filter()
 
     # astrbot.api.star
@@ -137,29 +154,47 @@ class FakeResult:
         return "".join(getattr(c, "text", "") for c in self.chain)
 
 
-class FakeChain:
-    """模拟 MessageChain：有 type、有 chain 列表、有 get_plain_text。"""
+class FakeChain(main.MessageChain):
+    """模拟 AstrBot MessageChain：有 type、有 chain 列表、有 get_plain_text。"""
 
     def __init__(self, text=None, type_=None, comps=None):
-        self.type = type_
-        self.chain = comps if comps is not None else ([Plain(text)] if text else [])
-
-    def get_plain_text(self):
-        return "".join(getattr(c, "text", "") for c in self.chain)
+        super().__init__(
+            chain=comps if comps is not None else ([Plain(text)] if text else []),
+            type=type_,
+        )
 
 
 class FakeEvent:
-    def __init__(self, result):
+    def __init__(self, result=None):
         self._result = result
+        self.sent_stream = None
+        self.sent_args = None
 
     def get_result(self):
         return self._result
+
+    async def send_streaming(self, generator, use_fallback=False):
+        """模拟真实平台适配器：接收生成器并逐块消费。"""
+        self.sent_args = use_fallback
+        self.sent_stream = []
+        async for item in generator:
+            self.sent_stream.append(item)
+        return self.sent_stream
 
 
 async def run_plugin(plugin, result):
     event = FakeEvent(result)
     await plugin.on_decorating_result(event)
     return event.get_result()
+
+
+async def run_stream_hook(plugin, chunks, use_fallback=False):
+    """模拟真实管线：先触发 on_llm_request，再调用 event.send_streaming。"""
+    event = FakeEvent()
+    await plugin.on_llm_request(event, object())
+    source = fake_source(chunks)
+    await event.send_streaming(source, use_fallback)
+    return event
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +223,7 @@ check("非流式-自定义标签", r.chain[0].text, "正文")
 
 
 # ---------------------------------------------------------------------------
-# 流式
+# 流式：直接验证 send_streaming 接管路径
 # ---------------------------------------------------------------------------
 async def fake_source(chunks):
     for c in chunks:
@@ -232,6 +267,34 @@ check(
     asyncio.run(collect_stream(p, ["<Think type='x'>", "a", "</THINK>", "正文"])),
     "正文",
 )
+
+# 真实管线回归：on_llm_request 接管 event.send_streaming 后再交给适配器
+stream_event = asyncio.run(
+    run_stream_hook(p, ["<thi", "nk>", "思考", "</thi", "nk>", "你好"], True)
+)
+check(
+    "真实流式挂点-send_streaming",
+    "".join(item.get_plain_text() for item in stream_event.sent_stream),
+    "你好",
+)
+check("真实流式挂点-透传 fallback 参数", stream_event.sent_args, True)
+check(
+    "真实流式挂点-尾部仍为 MessageChain",
+    all(isinstance(item, main.MessageChain) for item in stream_event.sent_stream),
+    True,
+)
+
+
+# 同一个事件可能触发多次 on_llm_request，必须幂等，不能套多层包装
+async def check_idempotent_patch():
+    event = FakeEvent()
+    await p.on_llm_request(event, object())
+    first = event.send_streaming
+    await p.on_llm_request(event, object())
+    return first is event.send_streaming
+
+
+check("真实流式挂点-补丁幂等", asyncio.run(check_idempotent_patch()), True)
 
 # 关键回归：分块时不能逐块 strip，正文内部换行/空格必须保留，只清整条回复的首尾
 check(

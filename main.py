@@ -5,15 +5,16 @@
 实现思路：
 - 非流式：在 `on_decorating_result`（发送消息前）里改写 message chain 中的 Plain 文本，
   使用预编译正则一次性剥离思考块，异常时原样放回。
-- 流式：`on_decorating_result` 触发时结果是 STREAMING_RESULT，`result.async_stream`
-  持有真正会被平台拉取的异步生成器。我们在那一刻把它**包一层**有状态过滤器
-  （见 think_filter.filter_stream），这样跨 chunk 的 `</thi` + `nk>` 也能正确处理。
+- 流式：AstrBot v4.28.0 的 `STREAMING_RESULT` 会跳过 `on_decorating_result`，
+  所以在 `on_llm_request` 中给当前 event 的 `send_streaming` 方法包一层，
+  让平台适配器逐块发送前经过有状态过滤器（见 think_filter.filter_stream）。
+  这样跨 chunk 的 `</thi` + `nk>` 也能正确处理。
 """
 
 from __future__ import annotations
 
 from astrbot.api import AstrBotConfig
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.message_components import Plain
 from astrbot.api.star import Context, Star
 
@@ -175,6 +176,11 @@ class ThinkFilterPlugin(Star):
                 chunk_setter=set_text,
                 on_removed=report_removed if log_removed else None,
             ):
+                # filter_stream 流结束时 flush 出的尾巴是裸字符串，
+                # 平台适配器要求 MessageChain，这里统一转换
+                if isinstance(item, str):
+                    item = MessageChain(chain=[Plain(item)])
+
                 if first:
                     if strip_ws:
                         item = _lstrip_chunk(item)
@@ -198,17 +204,61 @@ class ThinkFilterPlugin(Star):
 
         return wrapper()
 
-    # -- 钩子：发送消息前 --------------------------------------------------
+    # -- 钩子：LLM 请求前（流式过滤的真正挂点） ---------------------------
+
+    @filter.on_llm_request()
+    async def on_llm_request(self, event: AstrMessageEvent, req) -> None:
+        """LLM 请求发出前，给 event 实例的 send_streaming 打补丁。
+
+        为什么不用 on_decorating_result 处理流式：
+        ResultDecorateStage 的 process() 开头就有
+        ``if result.result_content_type == ResultContentType.STREAMING_RESULT: return``
+        —— 流式进行中该钩子根本不会触发（只在结束后以 STREAMING_FINISH
+        触发一次，那时内容早已发完）。因此包装 async_stream 的做法是无效的。
+
+        真正的挂点是 event.send_streaming：RespondStage 在发送流式结果时调用
+        ``await event.send_streaming(result.async_stream, realtime_segmenting)``，
+        平台适配器拿到生成器后逐块迭代发送。这里在实例上覆盖该方法，
+        把生成器先包一层有状态过滤器再交给原实现，即可拦截流式内容。
+
+        补丁只作用于当前 event 实例（不污染类），并且用标记保证幂等，
+        Agent 多步执行多次触发 on_llm_request 时不会重复包装。
+        """
+        if not self._enabled():
+            return
+        try:
+            if getattr(event, "_think_filter_stream_patched", False):
+                return
+            original = getattr(event, "send_streaming", None)
+            if not callable(original):
+                return
+            event._think_filter_stream_patched = True
+
+            plugin = self
+
+            async def patched_send_streaming(generator, *args, **kwargs):
+                wrapped = plugin._build_stream_wrapper(generator)
+                return await original(wrapped, *args, **kwargs)
+
+            event.send_streaming = patched_send_streaming
+            self.logger.debug("[think_filter] 已为本次事件接管 send_streaming")
+        except Exception:
+            # 补丁失败不影响正常回复，非流式路径仍然有效
+            self.logger.error("[think_filter] 流式接管失败", exc_info=True)
+
+    # -- 钩子：发送消息前（非流式路径） ------------------------------------
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent) -> None:
-        """发送消息前的钩子：同一入口同时覆盖非流式与流式。
+        """发送消息前的钩子：主要处理非流式结果，并兼容旧/特殊路径。
 
-        AstrBot v4.28.0 的 ResultDecorateStage 会在发送前触发该钩子：
-        - 非流式：result.chain 里已经是完整文本，直接改写即可；
-        - 流式：result.result_content_type == STREAMING_RESULT，
-          result.chain 为空，真正的数据在 result.async_stream 里，
-          因此这里包一层生成器，等平台适配器逐块拉取时再过滤。
+        AstrBot v4.28.0 的 ResultDecorateStage 会跳过 STREAMING_RESULT，
+        所以真正的实时流式拦截由 on_llm_request 中的 send_streaming 补丁完成。
+
+        本钩子负责：
+        - 非流式：result.chain 里是完整文本，直接改写 Plain 组件；
+        - 某些不走 send_streaming 的特殊/降级路径：尽力清理完整结果；
+        - STREAMING_FINISH：只做兜底清理，该结果本身不会再次发送。
         """
         if not self._enabled():
             return

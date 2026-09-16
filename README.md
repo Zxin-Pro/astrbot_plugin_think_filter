@@ -4,28 +4,42 @@
 
 适用版本：**AstrBot v4.28.0**（`metadata.yaml` 声明 `>=4.24.0,<5`）。
 
-## 用了哪个钩子，为什么
+## 使用的钩子，为什么
 
-只用一个钩子：`@filter.on_decorating_result()`（`OnDecoratingResultEvent`，"发送消息前"）。
+本插件使用两个钩子，分别处理两条真实管线：
 
-原因：
+### 非流式：`@filter.on_decorating_result()`
 
-1. 它是发送给用户之前的**最后一道**结果处理阶段（`astrbot/core/pipeline/result_decorate/stage.py`），
-   在这里改内容，不需要关心上游是哪个 provider、是否 Agent 模式。
-2. 它能同时覆盖两种输出形态：
-   - **非流式**：`result.chain` 里已经是完整文本，直接改写 `Plain` 组件即可。
-   - **流式**：`result.result_content_type == ResultContentType.STREAMING_RESULT`，
-     此时 `result.chain` 是空的，真正的数据在 `result.async_stream`（一个
-     `AsyncGenerator[MessageChain, None]`）。我们在钩子里把它**包一层**有状态过滤器，
-     等平台适配器逐块拉取时再过滤。
+发送消息前，`result.chain` 已经是完整文本，直接改写其中的 `Plain` 组件。
 
-> 注意：AstrBot 在流式场景触发该钩子时会打印一条 warning
-> （"Plugins that depend on the pre-send event hook may not work correctly when
-> streaming output is enabled."）。那是因为大多数插件只改 `result.chain`，
-> 而流式时 `chain` 为空。本插件额外处理了 `async_stream`，所以流式同样有效。
+### 流式：`@filter.on_llm_request()` 接管 `event.send_streaming`
 
-相比 `on_llm_response`：那个钩子拿不到"按 chunk 流式输出"的链路，无法处理跨 chunk 标签拆分，
-因此不适合本需求。
+AstrBot v4.28.0 的 `ResultDecorateStage` 开头会直接跳过
+`ResultContentType.STREAMING_RESULT`：
+
+```python
+if result.result_content_type == ResultContentType.STREAMING_RESULT:
+    return
+```
+
+所以 `on_decorating_result` **不会在流式进行中触发**，只能在流结束后收到一个
+`STREAMING_FINISH`，那时内容已经发给用户了。旧版插件错误地尝试在这个阶段包装
+`async_stream`，因此流式模式没有生效。
+
+现在改为在 `on_llm_request` 中给当前事件实例的 `send_streaming` 包一层：
+
+```text
+LLM 请求 → on_llm_request 接管 send_streaming
+         → RespondStage 调用 send_streaming(async_stream)
+         → 有状态过滤器逐 chunk 处理
+         → 平台适配器发送
+```
+
+这样可以正确处理 `<thi` + `nk>`、`</thi` + `nk>` 等跨 chunk 标签，并且不会污染
+AstrBot 的事件类。补丁带幂等标记，多次 LLM 请求不会重复套 wrapper。
+
+相比 `on_llm_response`：它发生在 LLM 响应完成后，拿不到已经交给平台的实时 chunk，
+不适合作为流式过滤入口。
 
 ## 已有的内置能力（避免重复造轮子）
 
@@ -49,7 +63,7 @@ astrbot_plugin_think_filter/
 ├── ruff.toml                # lint 配置
 └── tests/
     ├── test_think_filter.py         # 过滤核心单测（35 例）
-    ├── test_plugin_integration.py   # 用 AstrBot API 桩跑钩子（12 例）
+    ├── test_plugin_integration.py   # 用 AstrBot API 桩跑钩子（18 例）
     └── fuzz_think_filter.py         # 随机切块一致性模糊测试
 ```
 
@@ -74,8 +88,7 @@ astrbot_plugin_think_filter/
 
 - **预编译正则**：`think_filter.py` 里按标签集合缓存 `re.compile` 结果，不在调用时重复编译。
 - **快速路径**：文本里不含 `<think`（配置的任一标签）时直接返回原文，零正则开销。
-- **流式不逐块正则**：用 `find` + 状态机（`STATE_OUTSIDE` / `STATE_INSIDE`）扫描，
-  标签被切成 `</thi` + `nk>` 也能正确识别。
+- **流式不逐块正则**：通过 `on_llm_request` 接管 `send_streaming`，内部用 `find` + 状态机（`STATE_OUTSIDE` / `STATE_INSIDE`）扫描，标签被切成 `</thi` + `nk>` 也能正确识别。
 - **首字延迟**：只有"疑似标签前缀"（如 `<thi`、`<think type="`）会被缓冲，
   普通文本立即输出，所以正常回复的首字延迟不受影响。
 - **异常兜底**：正则或状态机抛异常时返回/放行原文；钩子内部异常只记日志，不影响正常回复。
@@ -86,7 +99,7 @@ astrbot_plugin_think_filter/
 ```bash
 cd astrbot_plugin_think_filter
 python3 tests/test_think_filter.py        # 35 passed
-python3 tests/test_plugin_integration.py  # 12 passed
+python3 tests/test_plugin_integration.py  # 18 passed
 python3 tests/fuzz_think_filter.py        # 0 mismatches
 ```
 
