@@ -120,9 +120,33 @@ check(
     "你好  世界",
 )
 check(
-    "流式-不误删 thinking",
-    stream_sync("<thinking>keep</thinking>"),
+    "流式-不误删 thinking（仅配置 think 时）",
+    stream_sync("<thinking>keep</thinking>", tags=("think",)),
     "<thinking>keep</thinking>",
+)
+check(
+    "流式-默认配置下 thinking 标签被过滤",
+    stream_sync("<thinking>x</thinking>正文", tags=("think", "thinking")),
+    "正文",
+)
+check(
+    "流式-开闭不匹配也可闭合",
+    stream_sync("<thinking>abc</think>正文", tags=("thinking",)),
+    "正文",
+)
+check(
+    "非流式-开闭不匹配也可闭合",
+    strip_think("<thinking>abc</think>正文", tags=("thinking",)),
+    "正文",
+)
+check(
+    "非流式-无关闭合标签不吞正文（keep）",
+    strip_think(
+        "<thinking>abc</div>def</thinking>回复",
+        tags=("thinking",),
+        unclosed_action="keep",
+    ),
+    "回复",
 )
 check(
     "流式-小块 2 字符",

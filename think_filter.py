@@ -19,28 +19,61 @@ from typing import Any
 _PATTERN_CACHE: dict[tuple[str, ...], tuple[re.Pattern[str], re.Pattern[str]]] = {}
 
 
-def _get_patterns(tags: tuple[str, ...]) -> tuple[re.Pattern[str], re.Pattern[str]]:
-    """按标签集合获取（并缓存）[成对标签正则, 未闭合标签正则]。"""
-    if tags in _PATTERN_CACHE:
-        return _PATTERN_CACHE[tags]
+def _close_name_ok(name: str, norm: tuple[str, ...]) -> bool:
+    """校验闭合标签名是否合法。
 
-    if not tags:
-        never = re.compile(r"(?!x)x")  # 永不匹配
-        _PATTERN_CACHE[tags] = (never, never)
-        return never, never
+    宽容策略：闭合名与任一配置标签互为前缀即可（如配置 thinking 也能被
+    </think> 闭合）。开闭不匹配是模型漏过滤/吞回复的重要来源，闭合方向
+    宽容不会误伤正文（正常回复几乎不会包含 </think 样式的文本）。
+    """
+    name = name.strip().lower()
+    if len(name) < 3:
+        return False
+    return any(name.startswith(t) or t.startswith(name) for t in norm)
 
-    # 标签名做 re.escape，防止配置里出现正则元字符
-    alt = "|".join(re.escape(t) for t in tags)
-    pair = re.compile(
-        rf"<(?:{alt})\b[^>]*>.*?</(?:{alt})\s*[^>]*>",
-        re.DOTALL | re.IGNORECASE,
-    )
-    unclosed = re.compile(
-        rf"<(?:{alt})\b[^>]*>.*$",
-        re.DOTALL | re.IGNORECASE,
-    )
-    _PATTERN_CACHE[tags] = (pair, unclosed)
-    return pair, unclosed
+
+def _strip_pairs(text: str, norm: tuple[str, ...], unclosed_action: str) -> str:
+    """手工扫描成对标签：语义与流式状态机完全一致。
+
+    - 起始标签严格匹配配置的标签名（\b 边界，<thinking> 不会被 <think> 误匹配）
+    - 闭合标签宽容匹配（互为前缀即可），消除开闭不匹配导致的"未闭合"误判
+    - 找不到合法闭合时按 unclosed_action 处理（drop=删到结尾 / keep=原样保留）
+    """
+    open_re = re.compile(rf"<(?:{'|'.join(norm)})\b[^>]*>", re.IGNORECASE | re.DOTALL)
+    close_re = re.compile(r"</\s*([a-zA-Z0-9_-]+)\s*[^>]*>", re.IGNORECASE)
+
+    out: list[str] = []
+    pos = 0
+    n = len(text)
+    while pos < n:
+        m = open_re.search(text, pos)
+        if not m:
+            out.append(text[pos:])
+            break
+        out.append(text[pos : m.start()])
+
+        # 向后找第一个"合法"的闭合标签（跳过无关的 </xxx>）
+        scan = m.end()
+        closed_end = -1
+        while True:
+            cm = close_re.search(text, scan)
+            if not cm:
+                break
+            if _close_name_ok(cm.group(1), norm):
+                closed_end = cm.end()
+                break
+            # 非法候选：只前进 1 字符，避免吞掉嵌套其中的合法闭合
+            # （如 </thi123<</THINK> 中的 </THINK>）
+            scan = cm.start() + 1
+
+        if closed_end != -1:
+            pos = closed_end  # 整块丢弃
+        elif unclosed_action == "drop":
+            pos = n  # 未闭合：删除到结尾
+        else:
+            out.append(text[m.start() :])  # keep：原样保留
+            pos = n
+    return "".join(out)
 
 
 def normalize_tags(tags: Iterable[str]) -> tuple[str, ...]:
@@ -75,11 +108,7 @@ def strip_think(
         if not any(f"<{t}" in lowered for t in norm):
             return text
 
-        pair_re, unclosed_re = _get_patterns(norm)
-        result = pair_re.sub("", text)
-        # 成对替换后可能残留未闭合的起始标签；按配置决定是否删到结尾
-        if unclosed_action != "keep":
-            result = unclosed_re.sub("", result)
+        result = _strip_pairs(text, norm, unclosed_action)
         return result.strip() if strip_whitespace else result
     except Exception:
         return text
@@ -99,6 +128,9 @@ _TAG_DELIMS = frozenset(" \t\r\n>/")
 # 非流式正则用 '<think\\b' 判定标签名结束，因此流式侧必须用同样的规则，
 # 否则 '<think，' 这类畸形输入会导致流式与非流式结果不一致。
 _WORD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+
+# 闭合标签名匹配：'</' + 标签名（字母数字下划线连字符）
+_CLOSE_NAME_RE = re.compile(r"</\s*([a-zA-Z0-9_-]+)", re.IGNORECASE)
 
 
 def _is_word_boundary_after(text: str, pos: int) -> bool:
@@ -144,23 +176,21 @@ class StreamThinkFilter:
     # -- 标签识别 ---------------------------------------------------------
 
     def _match_close_tag(self, text: str, pos: int) -> int | None:
-        """匹配结束标签，语义与非流式正则的 ``</tag\\s*[^>]*>`` 保持一致。
+        """匹配结束标签：宽容策略，闭合名与任一配置标签互为前缀即可。
 
-        即标签名之后允许任意非 ``>`` 字符（``\\s*`` + ``[^>]*``），
-        所以 ``</think >``、``</thinking>``、``</thinkin>`` 都能闭合一个
-        ``<think ...>`` 块。这样流式与非流式的判定结果一致。
+        例如配置 thinking 时，</think>、</thinking>、</thinkin> 都能闭合；
+        开闭不匹配（<thinking>...</think>）不再被误判为"未闭合"。
+        闭合方向宽容不会误伤正文（正常回复几乎不含 </think 样式文本）。
         """
-        probe = text[pos:].lower()
-        if not probe.startswith("</"):
+        m = _CLOSE_NAME_RE.match(text, pos)
+        if not m:
             return None
-        for tag in self.tags:
-            head = f"</{tag}"
-            if not probe.startswith(head):
-                continue
-            end = text.find(">", pos + len(head))
-            if end != -1:
-                return end + 1
-        return None
+        if not _close_name_ok(m.group(1), self.tags):
+            return None
+        end = text.find(">", m.end())
+        if end == -1:
+            return None
+        return end + 1
 
     def _match_tag(self, text: str, pos: int, closing: bool) -> int | None:
         """text[pos] 为 '<'；若匹配到当前状态需要的完整标签则返回其结束后一位。
@@ -269,6 +299,20 @@ class StreamThinkFilter:
                     plen = self._partial_prefix_len(self.buffer, 0)
                     if plen:
                         break  # 等下一个 chunk
+
+                    # 2.5) 思考块内的 "</名称...>"：闭合名后允许杂字符，
+                    # 必须等出现 '>' 才能判定是否合法闭合（与非流式一致），
+                    # 否则 "</thi请" 这类会被提前当普通内容消费掉
+                    if (
+                        self.state == STATE_INSIDE
+                        and self.buffer.startswith("</")
+                        and ">" not in self.buffer
+                    ):
+                        nm = _CLOSE_NAME_RE.match(self.buffer)
+                        if nm:
+                            name = nm.group(1).lower()
+                            if any(t.startswith(name) or name.startswith(t) for t in self.tags):
+                                break  # 等待 '>' 或更多字符
 
                     # 3) 确认不是标签，'<' 本身当普通文本处理
                     char, self.buffer = self.buffer[0], self.buffer[1:]

@@ -80,7 +80,7 @@ class ThinkFilterPlugin(Star):
         """插件加载时打印生效的配置，方便在日志里确认配置是否真正生效。"""
         self.logger.info(
             "[think_filter] v%s 已加载 | tags=%s | 未闭合=%s | 流式过滤=%s | 移除日志=%s",
-            "1.2.0",
+            "1.2.1",
             self._tags(),
             self._unclosed_action(),
             self._stream_enabled(),
@@ -263,7 +263,7 @@ class ThinkFilterPlugin(Star):
         """查看思考过滤器当前生效的配置（用于确认配置是否真正加载）。"""
         yield event.plain_result(
             "[think_filter] 当前生效配置\n"
-            f"版本: 1.2.0\n"
+            f"版本: 1.2.1\n"
             f"启用: {self._enabled()}\n"
             f"过滤标签: {', '.join(self._tags())}\n"
             f"未闭合处理: {self._unclosed_action()}\n"
